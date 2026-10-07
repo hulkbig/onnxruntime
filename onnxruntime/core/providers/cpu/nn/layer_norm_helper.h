@@ -56,7 +56,8 @@ class LayerNormHelper {
                             const TensorShape& bias_shape,
                             bool has_bias,
                             int64_t axis,
-                            LayerNormParams& params) {
+                            LayerNormParams& params,
+                            bool allow_empty_norm = false) {
     // Initialize basic layout parameters: how many rows we have and how many elements
     // are normalized per row, as well as the total scale/bias sizes.
     params.num_rows = x_shape.SizeToDimension(onnxruntime::narrow<size_t>(axis));
@@ -68,10 +69,11 @@ class LayerNormHelper {
     params.axis = axis;
 
     // Allow norm_size == 1 (scalar normalization is valid according to ONNX spec).
-    if (params.norm_size < 1) {
+    if (params.norm_size < 1 && !(allow_empty_norm && params.norm_size == 0)) {
       params.broadcast_param = kLayerNormInvalidInput;
       return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, kLayerNormInvalidSize, params.norm_size);
-    } else if (params.scale_size != params.norm_size || (has_bias && params.bias_size != params.scale_size)) {
+    } else if (params.norm_size != 0 &&
+               (params.scale_size != params.norm_size || (has_bias && params.bias_size != params.scale_size))) {
       params.broadcast_param = GetBroadcastParam(x_shape, scale_shape, has_bias ? &bias_shape : nullptr, axis);
       // Try to encode simple (B, S, ...) layouts into broadcast_param so that the
       // fast-path can be used. If this fails, broadcast_param will be set to
@@ -118,6 +120,10 @@ class LayerNormHelper {
                              " scale.shape=", scale_shape,
                              " bias.shape=", bias_shape,
                              " and axis=", axis);
+    }
+
+    if (params.norm_size == 0) {
+      return Status::OK();
     }
 
     // Compute strides for scale/bias once

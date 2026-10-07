@@ -930,6 +930,100 @@ TEST(LayerNormTest, LayerNorm_AxisExceedsRank) {
   }
 }
 
+template <typename T>
+static void TestEmptyNormalizedDimension() {
+  for (bool initializer : {false, true}) {
+    for (int64_t parameter_size : {0, 1}) {
+      for (bool with_bias : {false, true}) {
+        for (int64_t axis : {-1, 1}) {
+          SCOPED_TRACE(MakeString("initializer=", initializer, " parameter_size=", parameter_size,
+                                  " with_bias=", with_bias, " axis=", axis));
+          OpTester test("LayerNormalization", 17);
+          test.AddAttribute("axis", axis);
+          test.AddInput<T>("X", {2, 0}, {});
+          test.AddInput<T>("Scale", {parameter_size}, std::vector<T>(parameter_size, T(1.0f)), initializer);
+          if (with_bias) {
+            test.AddInput<T>("B", {parameter_size}, std::vector<T>(parameter_size, T(0.0f)), initializer);
+          }
+          test.AddOutput<T>("Y", {2, 0}, {});
+          test.ConfigEp(DefaultCpuExecutionProvider()).RunWithConfig();
+        }
+      }
+    }
+
+    // Empty tensors can have null data pointers, but supplied invalid shapes must
+    // still be checked, including when narrow-float weights are initializers.
+    for (const std::vector<int64_t>& invalid_shape : {std::vector<int64_t>{3, 0}, {1, 2, 0}}) {
+      for (bool invalid_bias : {false, true}) {
+        SCOPED_TRACE(MakeString("initializer=", initializer, " invalid_bias=", invalid_bias,
+                                " parameter_rank=", invalid_shape.size()));
+        OpTester test("LayerNormalization", 17);
+        test.AddInput<T>("X", {2, 0}, {});
+        test.AddInput<T>("Scale", invalid_bias ? std::vector<int64_t>{0} : invalid_shape,
+                         std::vector<T>{}, initializer);
+        if (invalid_bias) {
+          test.AddInput<T>("B", invalid_shape, std::vector<T>{}, initializer);
+        }
+        test.AddOutput<T>("Y", {2, 0}, {});
+        std::vector<std::unique_ptr<IExecutionProvider>> providers;
+        providers.push_back(DefaultCpuExecutionProvider());
+        test.Run(OpTester::ExpectResult::kExpectFailure, kLayerNormInputShapeMismatchError,
+                 {}, nullptr, &providers);
+      }
+    }
+  }
+
+  // Requested statistics retain the existing zero-extent error, even if their
+  // own shape is empty and their data pointers could also be null.
+  for (int64_t rows : {0, 2}) {
+    for (int statistics : {1, 2, 3}) {
+      SCOPED_TRACE(MakeString("rows=", rows, " statistics=", statistics));
+      OpTester test("LayerNormalization", 17);
+      test.AddInput<T>("X", {rows, 0}, {});
+      test.AddInput<T>("Scale", {0}, {});
+      test.AddOutput<T>("Y", {rows, 0}, {});
+      if (statistics == 3) {
+        test.AddOptionalOutputEdge<float>();
+      } else {
+        test.AddOutput<float>("Mean", {rows, 1}, std::vector<float>(rows, 0.0f));
+      }
+      if (statistics != 1) {
+        test.AddOutput<float>("InvStdDev", {rows, 1}, std::vector<float>(rows, 0.0f));
+      }
+      std::vector<std::unique_ptr<IExecutionProvider>> providers;
+      providers.push_back(DefaultCpuExecutionProvider());
+      test.Run(OpTester::ExpectResult::kExpectFailure, kLayerNormInvalidSize, {}, nullptr, &providers);
+    }
+  }
+}
+
+TEST(LayerNormTest, EmptyNormalizedDimensionFloat) {
+  TestEmptyNormalizedDimension<float>();
+}
+
+TEST(LayerNormTest, EmptyNormalizedDimensionDouble) {
+  TestEmptyNormalizedDimension<double>();
+}
+
+TEST(LayerNormTest, EmptyNormalizedDimensionFloat16) {
+  TestEmptyNormalizedDimension<MLFloat16>();
+}
+
+TEST(LayerNormTest, EmptyNormalizedDimensionBFloat16) {
+  TestEmptyNormalizedDimension<BFloat16>();
+}
+
+TEST(LayerNormTest, EmptyNormalizedDimensionHelperRequiresOptIn) {
+  LayerNormParams params;
+  const auto status = LayerNormHelper::CheckInputs(TensorShape{2, 0}, TensorShape{0}, TensorShape{},
+                                                   false, 1, params);
+  EXPECT_FALSE(status.IsOK());
+  EXPECT_THAT(status.ErrorMessage(), testing::HasSubstr(kLayerNormInvalidSize));
+  EXPECT_TRUE(LayerNormHelper::CheckInputs(TensorShape{2, 0}, TensorShape{0}, TensorShape{},
+                                           false, 1, params, true)
+                  .IsOK());
+}
+
 // Edge case: constant weights (as in issue #20429)
 TEST(LayerNormTest, LayerNorm_ConstantWeights_LargeInput) {
   OpTester test("LayerNormalization", 17);

@@ -572,9 +572,10 @@ Status LayerNormImpl::ComputeImpl(OpKernelContext* p_ctx, int64_t orig_axis, flo
   }
 
   int output_index = 1;
+  Tensor* mean = nullptr;
   U* mean_data = nullptr;
   if (!simplified) {
-    Tensor* mean = p_ctx->Output(output_index++, TensorShape(mean_inv_std_dev_dim));
+    mean = p_ctx->Output(output_index++, TensorShape(mean_inv_std_dev_dim));
     if (mean != nullptr) {
       mean_data = mean->MutableData<U>();
     }
@@ -584,6 +585,16 @@ Status LayerNormImpl::ComputeImpl(OpKernelContext* p_ctx, int64_t orig_axis, flo
   Tensor* inv_std_dev = p_ctx->Output(output_index, TensorShape(mean_inv_std_dev_dim));
   if (inv_std_dev != nullptr) {
     inv_std_dev_data = inv_std_dev->MutableData<U>();
+  }
+
+  // An empty Y needs no reduction when neither statistic is requested. Validate
+  // parameter shapes even when an empty tensor's data pointer is null.
+  if (!simplified && mean == nullptr && inv_std_dev == nullptr &&
+      x_shape.SizeFromDimension(onnxruntime::narrow<size_t>(axis)) == 0) {
+    LayerNormParams params;
+    const bool has_bias = bias != nullptr || prepacked_bias_fp32_data_ != nullptr;
+    return LayerNormHelper::CheckInputs(x_shape, scale_shape, bias_shape, has_bias, axis, params,
+                                        /*allow_empty_norm=*/true);
   }
 
   onnxruntime::concurrency::ThreadPool* thread_pool = p_ctx->GetOperatorThreadPool();
@@ -608,6 +619,11 @@ Status LayerNormImpl::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr 
   ORT_UNUSED_PARAMETER(prepacked_weights);
 
   is_packed = false;
+  // Keep empty tensors as inputs so their presence survives a null packed buffer.
+  if (tensor.Shape().Size() == 0) {
+    return Status::OK();
+  }
+
   if (input_idx == 1) {  // scale
     prepacked_scale_fp32_shape_ = tensor.Shape();
     ConvertNarrowFloatToFloatIfNeeded(tensor, alloc, prepacked_scale_fp32_data_, is_packed);

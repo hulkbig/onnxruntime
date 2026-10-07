@@ -1274,6 +1274,123 @@ TEST_F(GraphTransformationTests, LayerNormFusionZeroNormalizedDimension) {
   }
 }
 
+#ifndef ENABLE_TRAINING_CORE
+// Training fusion additionally requests statistics, which still reject empty reductions.
+TEST_F(GraphTransformationTests, LayerNormFusionDynamicEmptyNormalizedDimension) {
+  for (int opset : {10, 17, 18}) {
+    for (int64_t axis : {-1, 1}) {
+      for (bool named_dimension : {false, true}) {
+        for (int64_t parameter_size : {-1, 0, 1, 4}) {
+          for (int64_t hidden_size : {0, 4}) {
+            if ((parameter_size == 4 && hidden_size == 0) ||
+                (parameter_size == 0 && hidden_size == 4)) {
+              continue;  // These parameter shapes cannot broadcast to this input.
+            }
+            SCOPED_TRACE(MakeString("opset=", opset, " axis=", axis,
+                                    " named_dimension=", named_dimension,
+                                    " parameter_size=", parameter_size, " hidden_size=", hidden_size));
+            std::string input_name, scale_name, bias_name, output_name;
+            auto build_test_case = [&](ModelTestBuilder& builder) {
+              auto* input = builder.MakeInput<float>({2, hidden_size}, -1.0f, 1.0f);
+              TensorShapeProto input_shape;
+              input_shape.add_dim()->set_dim_value(2);
+              auto* hidden_dim = input_shape.add_dim();
+              if (named_dimension) {
+                hidden_dim->set_dim_param("hidden");
+              }
+              input->SetShape(input_shape);
+
+              NodeArg* scale;
+              NodeArg* bias;
+              if (parameter_size == -1) {
+                scale = builder.MakeInput<float>({hidden_size}, std::vector<float>(hidden_size, 1.0f));
+                bias = builder.MakeInput<float>({hidden_size}, std::vector<float>(hidden_size, 0.0f));
+                TensorShapeProto parameter_shape;
+                *parameter_shape.add_dim() = *hidden_dim;
+                scale->SetShape(parameter_shape);
+                bias->SetShape(parameter_shape);
+              } else {
+                scale = builder.MakeInitializer<float>({parameter_size}, std::vector<float>(parameter_size, 1.0f));
+                bias = builder.MakeInitializer<float>({parameter_size}, std::vector<float>(parameter_size, 0.0f));
+              }
+
+              input_name = input->Name();
+              scale_name = scale->Name();
+              bias_name = bias->Name();
+              auto* two = builder.MakeInitializer<float>({}, {2.0f});
+              auto* epsilon = builder.MakeInitializer<float>({}, {1e-5f});
+              auto* mean = builder.MakeIntermediate();
+              auto* centered = builder.MakeIntermediate();
+              auto* squared = builder.MakeIntermediate();
+              auto* variance = builder.MakeIntermediate();
+              auto* adjusted = builder.MakeIntermediate();
+              auto* stddev = builder.MakeIntermediate();
+              auto* normalized = builder.MakeIntermediate();
+              auto* scaled = builder.MakeIntermediate();
+              auto* output = builder.MakeOutput();
+              output_name = output->Name();
+              auto add_reduce_mean = [&](NodeArg* in, NodeArg* out) {
+                if (opset >= 18) {
+                  auto* axes = builder.MakeInitializer<int64_t>({1}, {axis});
+                  builder.AddNode("ReduceMean", {in, axes}, {out});
+                } else {
+                  builder.AddNode("ReduceMean", {in}, {out}).AddAttribute("axes", std::vector<int64_t>{axis});
+                }
+              };
+              add_reduce_mean(input, mean);
+              builder.AddNode("Sub", {input, mean}, {centered});
+              builder.AddNode("Pow", {centered, two}, {squared});
+              add_reduce_mean(squared, variance);
+              builder.AddNode("Add", {variance, epsilon}, {adjusted});
+              builder.AddNode("Sqrt", {adjusted}, {stddev});
+              builder.AddNode("Div", {centered, stddev}, {normalized});
+              builder.AddNode("Mul", {scale, normalized}, {scaled});
+              builder.AddNode("Add", {scaled, bias}, {output});
+            };
+            auto check_session = [&](InferenceSessionWrapper& session) {
+              auto counts = CountOpsInGraph(session.GetGraph());
+              EXPECT_EQ(counts["LayerNormalization"], 1);
+              EXPECT_EQ(counts["ReduceMean"], 0);
+              if (parameter_size == -1 || parameter_size == 1) {
+                auto allocator = TestCPUExecutionProvider()->CreatePreferredAllocators()[0];
+                for (int64_t width : {4, 0, 4}) {
+                  SCOPED_TRACE(MakeString("same-session width=", width));
+                  NameMLValMap feeds;
+                  std::vector<float> values(static_cast<size_t>(2 * width));
+                  for (size_t i = 0; i < values.size(); ++i) {
+                    values[i] = static_cast<float>(i);
+                  }
+                  CreateMLValue<float>(allocator, {2, width}, values, &feeds[input_name]);
+                  if (parameter_size == -1) {
+                    CreateMLValue<float>(allocator, {width}, std::vector<float>(width, 1.0f), &feeds[scale_name]);
+                    CreateMLValue<float>(allocator, {width}, std::vector<float>(width, 0.0f), &feeds[bias_name]);
+                  }
+                  RunOptions run_options;
+                  std::vector<OrtValue> outputs;
+                  ASSERT_STATUS_OK(session.Run(run_options, feeds, {output_name}, &outputs));
+                  ASSERT_EQ(outputs.size(), 1u);
+                  const Tensor& output = outputs[0].Get<Tensor>();
+                  EXPECT_EQ(output.Shape(), (TensorShape{2, width}));
+                  constexpr float expected[] = {-1.3416355f, -0.4472118f, 0.4472118f, 1.3416355f};
+                  for (size_t i = 0; i < values.size(); ++i) {
+                    EXPECT_NEAR(output.Data<float>()[i], expected[i % 4], 1e-5f);
+                  }
+                }
+              }
+            };
+            const auto level = opset >= 17 ? TransformerLevel::Level1 : TransformerLevel::Level2;
+            const InlinedHashSet<std::string_view> compatible_eps = {};
+            TransformerTester(build_test_case, check_session, TransformerLevel::Default, level, opset,
+                              1e-5, 1e-5, std::make_unique<LayerNormFusion>(compatible_eps, level));
+          }
+        }
+      }
+    }
+  }
+}
+
+#endif
+
 // Current-opset regression tests for LayerNorm and SkipLayerNorm fusions.
 // These construct minimal graphs at the current ONNX opset and verify the optimizer fires.
 
